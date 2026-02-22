@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-VENV="/Users/canine89/Documents/dev/skills/.venv/bin/activate"
+VENV="${VENV:-$(cd "$SKILL_DIR/../.." && pwd)/.venv/bin/activate}"
 source "$VENV"
 
 # 1. section0.xml 작성
