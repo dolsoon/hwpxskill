@@ -628,6 +628,58 @@ def report_to_dict(r: PitfallReport) -> dict[str, Any]:
     }
 
 
+def check_in_process(
+    hwpx_path: Path | str,
+    *,
+    baseline: Path | str | None = None,
+    chars_per_line: int = CHARS_PER_LINE_DEFAULT,
+    strict: bool = False,
+    verbose: bool = True,
+    out: Any = None,
+) -> int:
+    """Run the full pitfall check in-process (no subprocess) and return an
+    exit-code-compatible int.
+
+    Designed for ops/ scripts that want to skip the ~70 ms of cold Python
+    startup + lxml import incurred by spawning pitfall_check as a subprocess.
+    Output is printed to `out` (default sys.stderr) only when verbose=True.
+    """
+
+    out = out if out is not None else sys.stderr
+    cur = run_checks(Path(hwpx_path), chars_per_line=chars_per_line)
+    if baseline is not None:
+        base = run_checks(Path(baseline), chars_per_line=chars_per_line)
+        cur = diff_against_baseline(cur, base)
+
+    errors = [r for r in cur if r.severity == "error"]
+    warns = [r for r in cur if r.severity == "warn"]
+    notes = [r for r in cur if r.severity == "note"]
+
+    if verbose:
+        if not cur:
+            print(f"PITFALL_CHECK PASS: {hwpx_path}", file=out)
+        else:
+            print(
+                f"PITFALL_CHECK: {hwpx_path} "
+                f"({len(errors)} error, {len(warns)} warn, {len(notes)} note)",
+                file=out,
+            )
+            for r in errors:
+                print(f"  [ERROR] {r.code}: {r.message}", file=out)
+            for r in warns:
+                print(f"  [WARN]  {r.code}: {r.message}", file=out)
+            for r in notes:
+                print(f"  [NOTE]  {r.code}: {r.message}", file=out)
+
+    if errors:
+        return 1
+    if warns and strict:
+        return 1
+    if warns:
+        return 2
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="HWPX OWPML pitfall checker (Mac 한글 무한루프 방지 게이트).",

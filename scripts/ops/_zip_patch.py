@@ -17,6 +17,15 @@ from zipfile import ZipFile, ZipInfo
 SCRIPT_DIR = Path(__file__).resolve().parent.parent  # .../scripts
 PITFALL_CHECK = SCRIPT_DIR / "pitfall_check.py"
 
+# Import pitfall_check as a module so ops can call it in-process and avoid
+# ~70 ms of Python cold start + lxml import per invocation. Falls back to
+# subprocess silently if the module fails to import (e.g., name conflict).
+sys.path.insert(0, str(SCRIPT_DIR))
+try:
+    import pitfall_check as _pitfall_mod  # noqa: E402
+except Exception:  # pragma: no cover - defensive
+    _pitfall_mod = None
+
 
 def patch_zip_entry(
     src: Path,
@@ -64,9 +73,23 @@ def read_zip_entry(src: Path, entry: str) -> bytes:
 
 
 def run_pitfall_check(
-    hwpx: Path, baseline: Path | None = None, strict: bool = False
+    hwpx: Path,
+    baseline: Path | None = None,
+    strict: bool = False,
+    *,
+    in_process: bool = True,
 ) -> int:
-    """Invoke pitfall_check.py as subprocess; return its exit code."""
+    """Run pitfall_check; return its exit code.
+
+    Default `in_process=True` calls the imported module directly (saves
+    ~70 ms vs subprocess). Set False to force subprocess (fallback or
+    isolation). Falls back automatically if module import failed.
+    """
+
+    if in_process and _pitfall_mod is not None:
+        return _pitfall_mod.check_in_process(
+            hwpx, baseline=baseline, strict=strict, verbose=True
+        )
 
     cmd = [sys.executable, str(PITFALL_CHECK), str(hwpx)]
     if baseline is not None:
