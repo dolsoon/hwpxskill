@@ -541,24 +541,79 @@ def run_checks(
 def diff_against_baseline(
     current: list[PitfallReport], baseline: list[PitfallReport]
 ) -> list[PitfallReport]:
-    """Return only reports whose (code, key-detail signature) is not present in
-    baseline. Lets users accept inherited violations (e.g., v24 baseline) and
-    fail only on regressions introduced by edits."""
+    """Return only reports whose (code, identity-set signature) is not present
+    in baseline.
+
+    Identity-set signature picks ONLY the location/identity of each violation
+    (paragraph id, table+row, duplicate-id values, etc.). Volatile noise like
+    text length or lineseg count is intentionally excluded so that re-running
+    the same edit twice yields the same signature, while a NEW violation
+    location DOES create a fresh signature.
+    """
 
     def sig(r: PitfallReport) -> tuple:
-        # signature: code + count of violations / missing / etc.
         d = r.detail or {}
-        # pick stable scalar fields
-        keys = (
-            "missing_count",
-            "table_width",
-        )
-        scalar = tuple((k, d.get(k)) for k in keys if k in d)
-        # shape-based
-        for shape_key in ("violations_sample", "missing_paragraph_ids_sample"):
-            if shape_key in d:
-                scalar += ((shape_key + "_len", len(d[shape_key])),)
-        return (r.code, scalar)
+
+        # P1: identity = the SET of duplicate id values
+        if r.code == "P1_DUPLICATE_PARA_ID":
+            ids = tuple(sorted((d.get("duplicate_groups") or {}).keys()))
+            return (r.code, ("dup_ids", ids))
+
+        # P2: identity = the SET of paragraph ids missing lineseg
+        if r.code == "P2_MISSING_LINESEG":
+            ids = tuple(sorted(d.get("missing_paragraph_ids_sample") or []))
+            return (r.code, ("missing_ids_sample", ids))
+
+        # P3: identity = (table_id, duplicate_cell, occupier_cell) tuples
+        if r.code == "P3_SPAN_OCCUPATION":
+            rows = tuple(
+                sorted(
+                    (
+                        v.get("table_id"),
+                        tuple(sorted((v.get("duplicate_cell") or {}).items())),
+                        tuple(sorted((v.get("occupier_cell") or {}).items())),
+                    )
+                    for v in (d.get("violations_sample") or [])
+                )
+            )
+            return (r.code, ("span_violations", rows))
+
+        # P4: identity = the SET of paragraph ids with blow-up risk
+        if r.code == "P4_JUSTIFY_LINESEG_BLOWUP":
+            ids = tuple(
+                sorted(
+                    v.get("paragraph_id")
+                    for v in (d.get("violations_sample") or [])
+                )
+            )
+            return (r.code, ("blowup_pids", ids))
+
+        # P5: identity = (table_id, row_index) tuples
+        if r.code == "P5_CELLSZ_WIDTH_MISMATCH":
+            rows = tuple(
+                sorted(
+                    (v.get("table_id"), v.get("row_index"))
+                    for v in (d.get("violations_sample") or [])
+                )
+            )
+            return (r.code, ("cellsz_rows", rows))
+
+        # P6: identity = (element, attribute, value) tuples
+        if r.code == "P6_UNDEFINED_IDREF":
+            rows = tuple(
+                sorted(
+                    (
+                        v.get("element"),
+                        v.get("attribute"),
+                        v.get("value"),
+                    )
+                    for v in (d.get("violations_sample") or [])
+                )
+            )
+            return (r.code, ("idref_rows", rows))
+
+        # P7 and notes: code alone (advisory; baseline-equal if both emit it)
+        return (r.code, ())
 
     base_sigs = {sig(r) for r in baseline}
     return [r for r in current if sig(r) not in base_sigs]
