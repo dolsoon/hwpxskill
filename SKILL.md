@@ -1,12 +1,46 @@
 ---
 name: hwpx
-description: "한글(HWPX) 문서 생성/읽기/편집 스킬. .hwpx 파일, 한글 문서, Hancom, OWPML 관련 요청 시 사용."
+description: "한글(HWPX) 문서 생성/읽기/편집 스킬. 텍스트 치환·표 셀/행 수정·색상 변경·단락 추가/삭제는 scripts/ops/ 스니펫 사용 (Mac 한글 무한루프 방지 게이트 자동 호출). 새 표/그림/스타일 생성은 scripts/build_hwpx.py. .hwpx 파일, 한글 문서, Hancom, OWPML 관련 요청 시 사용."
 ---
 
-# HWPX 문서 스킬 — 레퍼런스 복원 우선(XML-first) 워크플로우
+# HWPX 문서 스킬 — ops 우선, XML 직접 편집은 예외
 
-한글(Hancom Office)의 HWPX 파일을 **XML 직접 작성** 중심으로 생성, 편집, 읽기할 수 있는 스킬.
-HWPX는 ZIP 기반 XML 컨테이너(OWPML 표준)이다. python-hwpx API의 서식 버그를 완전히 우회하며, 세밀한 서식 제어가 가능하다.
+한글(Hancom Office)의 HWPX 파일을 안전하게 편집/생성하는 스킬. HWPX는 ZIP 기반 XML 컨테이너(OWPML 표준). python-hwpx API의 서식 버그를 우회하며, raw 바이트 patch + 자동 함정 검사로 Mac 한글 무한루프 사고를 시스템적으로 방지한다.
+
+## 작업 → 명령 매핑 (Cheatsheet — 매번 이 표를 먼저 본다)
+
+| 작업 유형 | 명령 | 비고 |
+|----------|------|------|
+| 본문 텍스트 치환 | `ops/replace_text.py --find X --replace Y` | substring(기본), --whole-node, --raw |
+| 표 셀 텍스트 교체 | `ops/swap_table_cells.py --table N --col C --row R --text X` | `--list`로 표/셀 좌표 확인 |
+| 색상 hex 직접 swap | `ops/change_color.py --map "#FROM=#TO"` | `--list`로 현재 색 인벤토리 |
+| 색상 정성적 변경 | `ops/change_color.py --darken/--lighten/--saturate/--shift-hue "#HEX=N"` | HSL 변환, 자동 hex 계산 |
+| 단락 블록 통째 교체 | `ops/replace_section.py --start "..." --end "..." --xml-file new.xml` | 마커 사이 통째 swap |
+| **단락 추가** | `ops/add_paragraph.py --after-text "마커" --text "새 본문"` | 또는 `--after-id` / `--before-text` / `--xml-file` |
+| **단락 삭제** | `ops/delete_paragraph.py --id N` 또는 `--text "마커"` | `--dry-run`으로 미리 확인 |
+| **표 행 추가** | `ops/add_table_row.py --table N [--cell COL=text ...]` | 마지막 행 복제, cellSz 자동 |
+| **표 행 삭제** | `ops/delete_table_row.py --table N --row R` | `--row -1` = 마지막 행 |
+| 여러 작업 chain | `ops/batch.py spec.json` | JSON으로 ops 리스트, pitfall_check 1회 |
+| 안전 게이트 (HARD) | (자동) `pitfall_check.py` | 모든 ops 끝에 in-process 자동 호출 |
+| 새 문서 생성 (스키마 from scratch) | `build_hwpx.py` (워크플로우 1, 5) | ops로 못 표현되는 신규 구조 |
+| 표 신규 생성 | `build_hwpx.py` + 직접 XML | ops에 없음 |
+| 그림/스타일 신규 추가 | 직접 XML 편집 (워크플로우 2) | BinData/ + content.hpf, header.xml |
+| 텍스트 추출 | `text_extract.py` | 읽기 전용 |
+| 기존 hwpx 분석 | `analyze_template.py` | 레퍼런스 청사진 |
+| (예외) unpack/edit/pack | `office/unpack.py` + `office/pack.py` | ops로 표현 불가능한 복잡 편집에만 |
+
+ops 우선. unpack/pack은 위 cheatsheet의 어느 ops로도 표현 못 하는 경우에만 사용. 매 ops 호출 끝에 `pitfall_check.py`가 in-process import로 자동 실행되어 7가지 OWPML 위반을 잡음 → Mac 한글 사고 방지.
+
+### Capability 한계 (ops로 안 되는 것)
+
+다음은 ops 라이브러리로 처리하지 못함 — `build_hwpx.py` 또는 직접 XML 편집 필요:
+
+- 새 표 생성 (rowCnt/colCnt/cellSz 전부 새로 설계)
+- 그림 삽입 (BinData/ 디렉토리 추가 + content.hpf 매니페스트 변경)
+- 새 paraPr/charPr 스타일 정의 (header.xml itemCnt 갱신)
+- 페이지 레이아웃 (secPr) 변경
+- 셀 병합/분할 (rowSpan/colSpan 재계산)
+- 쪽바닥/머리말 신규 추가
 
 ## Mac 한글 호환성 함정 (필독): 반복된 사고 방지 모음
 
