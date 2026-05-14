@@ -8,6 +8,57 @@ description: "한글(HWPX) 문서 생성/읽기/편집 스킬. .hwpx 파일, 한
 한글(Hancom Office)의 HWPX 파일을 **XML 직접 작성** 중심으로 생성, 편집, 읽기할 수 있는 스킬.
 HWPX는 ZIP 기반 XML 컨테이너(OWPML 표준)이다. python-hwpx API의 서식 버그를 완전히 우회하며, 세밀한 서식 제어가 가능하다.
 
+## Mac 한글 호환성 함정 (필독): 반복된 사고 방지 모음
+
+**Mac 한글이 raw 편집한 HWPX를 거부하거나 CPU 100%로 무한루프에 빠지는 OWPML 위반 패턴**이 있다. `validate.py`/`page_guard.py`만 통과해서는 충분하지 않다. 다음 7가지 함정을 반드시 점검할 것 — 상세 진단·수정 코드는 `references/hwpx-pitfalls.md` 참조.
+
+1. **단락 id 중복** — `<hp:p>`의 id가 placeholder(`2147483648`, `0`)로 대량 중복되어 있으면 한글이 거부
+2. **hp:linesegarray 누락** — 텍스트 있는 단락에 linesegarray가 없으면 한글이 첫 열기에서 모두 재계산 → 무한루프
+3. **rowSpan/colSpan 점유 자리에 빈 셀** — `rowSpan>1` 셀이 점유한 자리에 빈 `<hp:tc>`가 또 있으면 표 렌더링 무한루프
+4. **양쪽정렬 본문 단락에 단일 lineseg placeholder** — paraPr가 JUSTIFY인데 placeholder lineseg가 한 개만 있으면 한글이 자간을 극단적으로 늘림 (글자 사이 공백 폭주). **표 외부 본문 단락에서만 lineseg 제거**, 표 셀 단락은 유지
+5. **cellSz width 합 ≠ 표 width** — 각 행 cellSz width 합계가 `<hp:tbl>` sz width와 달라도 거부
+6. **header.xml에 미정의 IDRef 참조** — charPrIDRef/paraPrIDRef/borderFillIDRef
+7. **lxml 직렬화 부작용** — `etree.tostring`으로 트리 재직렬화하면 namespace 선언 순서·attribute 표기가 변해 Mac 한글이 거부 가능 → **raw 바이트 patch만 사용 권장**
+
+### [HARD] 자동 함정 검사 게이트 — 매 patch 후 반드시 실행
+
+raw XML을 한 번이라도 바꾼 모든 작업은 **`pitfall_check.py`로 게이트를 통과해야 완료 처리**한다. 사람의 눈은 7가지 함정을 모두 누락 없이 잡지 못한다. ops/ 스크립트는 자동으로 호출하므로 별도 조치가 필요 없으나, 직접 raw 편집했다면 명시 호출:
+
+```bash
+source "$VENV"
+python3 "$SKILL_DIR/scripts/pitfall_check.py" result.hwpx
+# exit 0 = clean, 1 = error (불통과), 2 = warning (옵션에 따라 통과)
+```
+
+원본 hwpx에 이미 baseline 위반(예: 한글 자체가 placeholder id를 남긴 상태)이 있을 때는 `--baseline` 으로 기존 위반은 무시하고 **신규 위반만** 잡는다:
+
+```bash
+python3 "$SKILL_DIR/scripts/pitfall_check.py" result.hwpx --baseline original.hwpx
+```
+
+JSON 출력으로 다른 도구와 연계:
+
+```bash
+python3 "$SKILL_DIR/scripts/pitfall_check.py" result.hwpx --json > report.json
+```
+
+이 게이트가 fail 상태로 남아 있으면 사용자에게 결과를 "완료"로 보고하지 말 것. 위반 코드(P1~P7)에 따른 수정 절차는 `references/hwpx-pitfalls.md` 함정 1~7 섹션 참조.
+
+### 안전한 raw 바이트 편집 원칙
+
+- 원본 ZIP의 entry 순서·압축·timestamp를 보존하고 `Contents/section0.xml`만 raw 바이트로 patch
+- 전체 트리를 lxml로 재직렬화하지 말 것. lxml은 진단 도구로만 사용
+- 패치 후 `pitfall_check.py` 통과 (HARD)
+- 최종 검증은 **Mac 한글에서 실제 열어보기**
+
+### Mac 한글 무한루프 진입 시 후속 처리
+
+```bash
+pkill -9 -f "Hancom Office HWP"
+rm -rf ~/Library/Saved\ Application\ State/com.hancom.*
+rm -rf /private/var/folders/*/T/Hwp120
+```
+
 ## 기본 동작 모드 (필수): 첨부 HWPX 분석 → 고유 XML 복원(99% 근접) → 요청 반영 재작성
 
 사용자가 `.hwpx`를 첨부한 경우, 이 스킬은 아래 순서를 **기본값**으로 따른다.
@@ -543,12 +594,99 @@ python3 "$SKILL_DIR/scripts/page_guard.py" \
 
 ---
 
+## 워크플로우 6: ops 스니펫 — 빠른 부분 편집 (unpack/pack 우회)
+
+전체를 unpack → 편집 → pack 하는 대신, **자주 쓰는 1-작업 단위 ops 스크립트**로 한 번에 처리한다. 각 ops 스크립트는:
+
+- `Contents/section0.xml`(또는 `header.xml`) 만 raw byte patch
+- 다른 ZIP entry의 순서·압축·timestamp 100% 보존
+- 패치 끝에 `pitfall_check.py`를 자동 호출 (`--no-check`로 스킵 가능, 비권장)
+
+### 1) `ops/replace_text.py` — 본문 텍스트 치환
+
+```bash
+source "$VENV"
+python3 "$SKILL_DIR/scripts/ops/replace_text.py" input.hwpx \
+  --find "구 표현" --replace "신 표현" -o output.hwpx
+# --first  : 첫 occurrence만 (기본값: 모두)
+# --raw    : <hp:t>로 자동 감싸지 않고 원시 바이트로 매칭 (고급)
+```
+
+매칭은 `<hp:t>...</hp:t>` 안에 통째로 들어 있는 텍스트만 찾는다. 여러 run에 걸친 텍스트는 swap_table_cells.py 또는 직접 patch 필요.
+
+### 2) `ops/swap_table_cells.py` — 표 셀 텍스트 교체
+
+```bash
+# 먼저 표 인덱스/셀 좌표 파악
+python3 "$SKILL_DIR/scripts/ops/swap_table_cells.py" input.hwpx --list
+
+# 단일 셀
+python3 "$SKILL_DIR/scripts/ops/swap_table_cells.py" input.hwpx -o out.hwpx \
+  --table 5 --col 1 --row 0 --text "새 헤더"
+
+# 같은 표 여러 셀 동시
+python3 "$SKILL_DIR/scripts/ops/swap_table_cells.py" input.hwpx -o out.hwpx \
+  --table 5 --cell 0,0=A --cell 1,0=B --cell 2,0=C
+```
+
+cellSz/cellSpan/borderFill/단락 id/linesegarray는 모두 보존. 셀 안 첫 `<hp:t>`만 교체 (다른 run은 `--run N`).
+
+### 3) `ops/change_color.py` — 색상 hex 일괄 변경
+
+```bash
+# 현재 사용된 색상 목록 + 빈도
+python3 "$SKILL_DIR/scripts/ops/change_color.py" input.hwpx --list
+
+# 단일 색 swap (header + section 둘 다)
+python3 "$SKILL_DIR/scripts/ops/change_color.py" input.hwpx -o out.hwpx \
+  --map "#7B8B3D=#1F4E79"
+
+# 여러 색을 textColor 속성에서만
+python3 "$SKILL_DIR/scripts/ops/change_color.py" input.hwpx -o out.hwpx \
+  --scope header --attr textColor \
+  --map "#000000=#1A1A1A" --map "#FF0000=#C00000"
+```
+
+`--scope header|section|both` (기본 both), `--attr ATTR_NAME`로 속성 지정 시 `attr="#HEX"` 형태만 매칭.
+
+### 4) `ops/replace_section.py` — 단락 블록 통째 교체
+
+```bash
+# 시작/끝 마커 사이의 byte 범위 미리 확인
+python3 "$SKILL_DIR/scripts/ops/replace_section.py" input.hwpx --probe \
+  --start "Ⅲ. 분석 결과" --end "Ⅳ. 결론"
+
+# 새 XML 파일로 교체
+python3 "$SKILL_DIR/scripts/ops/replace_section.py" input.hwpx -o out.hwpx \
+  --start "Ⅲ. 분석 결과" --end "Ⅳ. 결론" \
+  --xml-file new_chapter3.xml
+```
+
+블록 경계는 `<hp:p>...</hp:p>` 단위로 정렬 → 단락 중간을 자르지 않음. 교체 XML은 완전한 `<hp:p>` 요소들로 구성하고 id unique + linesegarray 포함을 보장. 패치 후 자동 pitfall_check 호출되므로 위반 발생 시 즉시 표면화.
+
+### ops 공통 옵션
+
+| 옵션 | 의미 |
+|------|------|
+| `-o/--output` | 출력 hwpx 경로 (입력과 달라야 함) |
+| `--baseline REF` | 기존 hwpx의 위반은 무시하고 신규 위반만 잡음 |
+| `--no-check` | pitfall_check 자동 호출 스킵 (디버깅용, 비권장) |
+
+ops 추가가 필요한 새 패턴은 `scripts/ops/_zip_patch.py`의 `patch_zip_entry` + `run_pitfall_check`를 사용해 같은 패턴으로 작성하면 된다. lxml 직렬화 금지, raw 바이트만 사용.
+
+---
+
 ## 스크립트 요약
 
 | 스크립트 | 용도 |
 |----------|------|
 | `scripts/build_hwpx.py` | **핵심** — 템플릿 + XML → HWPX 조립 |
 | `scripts/analyze_template.py` | HWPX 심층 분석 (레퍼런스 기반 생성의 청사진) |
+| `scripts/pitfall_check.py` | **HARD 게이트** — 7가지 OWPML 함정 자동 검사 (Mac 한글 무한루프 방지) |
+| `scripts/ops/replace_text.py` | 본문 텍스트 치환 (raw byte) |
+| `scripts/ops/swap_table_cells.py` | 표 셀 텍스트 교체 (raw byte) |
+| `scripts/ops/change_color.py` | 색상 hex 일괄 변경 (raw byte) |
+| `scripts/ops/replace_section.py` | 단락 블록 통째 교체 (raw byte) |
 | `scripts/office/unpack.py` | HWPX → 디렉토리 (XML pretty-print) |
 | `scripts/office/pack.py` | 디렉토리 → HWPX (mimetype first) |
 | `scripts/validate.py` | HWPX 파일 구조 검증 |
@@ -587,3 +725,5 @@ python3 "$SKILL_DIR/scripts/page_guard.py" \
 15. **무단 페이지 증가 금지**: 사용자 명시 요청/승인 없이 쪽수 증가를 유발하는 구조 변경 금지
 16. **구조 변경 제한**: 사용자 요청이 없는 한 문단/표의 추가·삭제·분할·병합 금지 (치환 중심 편집)
 17. **page_guard 필수 통과**: `validate.py`와 별개로 `page_guard.py`를 반드시 통과해야 완료 처리
+18. **[HARD] pitfall_check 필수 통과**: raw XML을 한 번이라도 patch 했다면 `pitfall_check.py`가 exit 0(또는 baseline 대비 신규 위반 0)이어야 완료 처리. ops/ 스크립트는 자동 호출하므로 직접 raw 편집 시에만 명시 호출 필요. fail 상태에서 사용자에게 결과 제출 금지
+19. **ops 우선**: 자주 쓰는 작업(텍스트 치환, 표 셀 교체, 색상 swap, 단락 블록 교체)은 unpack/pack 대신 `scripts/ops/`의 single-purpose 스크립트로 처리. 더 빠르고 자동 pitfall_check 통합되어 사고 위험 낮음
